@@ -12,6 +12,8 @@ use tauri::{AppHandle, Manager};
 use tauri_specta::Event;
 
 const DEBOUNCE: Duration = Duration::from_millis(30);
+const PLAIN_BINDING: &str = "transcribe";
+const POST_PROCESS_BINDING: &str = "transcribe_with_post_process";
 const RELEASE_GRACE: Duration = Duration::from_millis(50);
 
 /// Recording phase events for windows that follow along (onboarding's Try it).
@@ -193,6 +195,10 @@ enum Effect {
     Stop {
         binding_id: String,
         hotkey_string: String,
+        /// The recording started under plain `transcribe` and was upgraded
+        /// by the post-process combo: run the post-process action's stop
+        /// against the original binding's audio.
+        post_process: bool,
     },
 }
 
@@ -251,6 +257,10 @@ struct CoordinatorState {
     last_press: Option<Instant>,
     pending_release: Option<PendingRelease>,
     pending_press: Option<PendingPress>,
+    /// The in-flight push-to-talk recording started by `transcribe` was
+    /// upgraded by pressing the `transcribe_with_post_process` combo. Sticky
+    /// until the recording ends: never downgraded.
+    upgraded: bool,
 }
 
 impl CoordinatorState {
@@ -261,6 +271,7 @@ impl CoordinatorState {
             last_press: None,
             pending_release: None,
             pending_press: None,
+            upgraded: false,
         }
     }
 
@@ -281,7 +292,27 @@ impl CoordinatorState {
         matches!(self.stage, Stage::Recording(_)) && self.hold.as_ref().is_some_and(|h| h.locked)
     }
 
-    fn on_input(&mut self, input: InputEvent, now: Instant) -> Option<Effect> {
+    fn on_input(&mut self, mut input: InputEvent, now: Instant) -> Option<Effect> {
+        // Push-to-talk upgrade: the post-process combo contains plain
+        // `transcribe`'s keys, so pressing it on top of a held `transcribe`
+        // recording turns that same recording into a post-processed one. Its
+        // release (either key) then counts as the recording's release.
+        if input.binding_id == POST_PROCESS_BINDING
+            && input.mode == ShortcutActivation::PushToTalk
+            && matches!(&self.stage, Stage::Recording(id) if id.as_str() == PLAIN_BINDING)
+            && !self.is_locked()
+        {
+            if input.is_pressed {
+                if !self.upgraded {
+                    debug!("Upgrading recording to post-process");
+                    self.upgraded = true;
+                }
+                return None;
+            } else if self.upgraded {
+                input.binding_id = PLAIN_BINDING.to_string();
+            }
+        }
+
         let pending_release_binding = self
             .pending_release
             .as_ref()
@@ -503,12 +534,14 @@ impl CoordinatorState {
         {
             self.stage = Stage::Idle;
             self.hold = None;
+            self.upgraded = false;
         }
     }
 
     fn on_processing_finished(&mut self) -> Option<Effect> {
         self.stage = Stage::Idle;
         self.hold = None;
+        self.upgraded = false;
         let pending = self.pending_press.take()?;
         debug!(
             "Pipeline drained; starting remembered press for '{}'",
@@ -528,6 +561,7 @@ impl CoordinatorState {
         if !started && matches!(&self.stage, Stage::Recording(id) if id == binding_id) {
             self.stage = Stage::Idle;
             self.hold = None;
+            self.upgraded = false;
         }
     }
 
@@ -543,6 +577,7 @@ impl CoordinatorState {
     ) -> Effect {
         self.stage = Stage::Recording(binding_id.clone());
         self.hold = Some(Hold { pressed_at, locked });
+        self.upgraded = false;
         Effect::Start {
             binding_id,
             hotkey_string,
@@ -552,9 +587,11 @@ impl CoordinatorState {
     fn begin_processing(&mut self, binding_id: String, hotkey_string: String) -> Effect {
         self.stage = Stage::Processing;
         self.hold = None;
+        let post_process = std::mem::take(&mut self.upgraded) && binding_id == PLAIN_BINDING;
         Effect::Stop {
             binding_id,
             hotkey_string,
+            post_process,
         }
     }
 }
@@ -733,8 +770,9 @@ fn run_effect(app: &AppHandle, state: &mut CoordinatorState, effect: Effect) {
         Effect::Stop {
             binding_id,
             hotkey_string,
+            post_process,
         } => {
-            stop(app, &binding_id, &hotkey_string);
+            stop(app, &binding_id, &hotkey_string, post_process);
             emit_recording_phase(app, RecordingPhase::Stopped);
         }
     }
@@ -757,8 +795,15 @@ fn start(app: &AppHandle, binding_id: &str, hotkey_string: &str) -> bool {
     recording
 }
 
-fn stop(app: &AppHandle, binding_id: &str, hotkey_string: &str) {
-    let Some(action) = ACTION_MAP.get(binding_id) else {
+fn stop(app: &AppHandle, binding_id: &str, hotkey_string: &str, post_process: bool) {
+    // An upgraded recording stops through the post-process action, but the
+    // audio manager still knows it under the binding that started it.
+    let action_id = if post_process {
+        POST_PROCESS_BINDING
+    } else {
+        binding_id
+    };
+    let Some(action) = ACTION_MAP.get(action_id) else {
         warn!("No action in ACTION_MAP for '{binding_id}'");
         return;
     };
@@ -1278,6 +1323,106 @@ mod tests {
             hold_threshold: HOLD_THRESHOLD,
             external: false,
         }
+    }
+
+    fn bind_input(id: &str, is_pressed: bool) -> InputEvent {
+        InputEvent {
+            binding_id: id.to_string(),
+            hotkey_string: id.to_string(),
+            ..input(ShortcutActivation::PushToTalk, is_pressed)
+        }
+    }
+
+    fn stop_flag(e: Option<Effect>) -> Option<bool> {
+        match e {
+            Some(Effect::Stop { post_process, .. }) => Some(post_process),
+            _ => None,
+        }
+    }
+
+    /// Press transcribe, add the combo, release: one stop, post-processed,
+    /// even though both bindings' release events arrive.
+    #[test]
+    fn combo_pressed_over_transcribe_upgrades_to_one_post_process_stop() {
+        for combo_released_first in [false, true] {
+            let mut state = CoordinatorState::new();
+            let t0 = Instant::now();
+            assert!(matches!(
+                state.on_input(bind_input("transcribe", true), t0),
+                Some(Effect::Start { .. })
+            ));
+            // Within the debounce window: the upgrade must not be debounced.
+            assert!(state
+                .on_input(bind_input(POST_PROCESS_BINDING, true), t0 + ms(5))
+                .is_none());
+            assert_eq!(state.stage, Stage::Recording("transcribe".to_string()));
+
+            let order = if combo_released_first {
+                [POST_PROCESS_BINDING, "transcribe"]
+            } else {
+                ["transcribe", POST_PROCESS_BINDING]
+            };
+            let mut stops = Vec::new();
+            for (i, id) in order.iter().enumerate() {
+                let at = t0 + ms(800 + 10 * i as u64);
+                stops.push(stop_flag(state.on_input(bind_input(id, false), at)));
+            }
+            stops.push(stop_flag(state.on_grace_expired()));
+            let stops: Vec<bool> = stops.into_iter().flatten().collect();
+            assert_eq!(stops, vec![true], "exactly one post-processed stop");
+            assert_eq!(state.stage, Stage::Processing);
+            assert!(!state.upgraded);
+        }
+    }
+
+    /// Combo pressed directly: unchanged, post-process binding stops itself.
+    #[test]
+    fn combo_pressed_directly_is_unchanged() {
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        assert!(matches!(
+            state.on_input(bind_input(POST_PROCESS_BINDING, true), t0),
+            Some(Effect::Start { .. })
+        ));
+        assert!(!state.upgraded);
+        assert!(state
+            .on_input(bind_input(POST_PROCESS_BINDING, false), t0 + ms(800))
+            .is_none());
+        let eff = state.on_grace_expired();
+        assert!(matches!(
+            eff,
+            Some(Effect::Stop { ref binding_id, post_process: false, .. })
+                if binding_id.as_str() == POST_PROCESS_BINDING
+        ));
+    }
+
+    /// Transcribe alone: unchanged plain stop.
+    #[test]
+    fn transcribe_alone_is_unchanged() {
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        assert!(matches!(
+            state.on_input(bind_input("transcribe", true), t0),
+            Some(Effect::Start { .. })
+        ));
+        assert!(state
+            .on_input(bind_input("transcribe", false), t0 + ms(800))
+            .is_none());
+        assert_eq!(stop_flag(state.on_grace_expired()), Some(false));
+    }
+
+    /// Toggle mode never upgrades.
+    #[test]
+    fn toggle_mode_does_not_upgrade() {
+        let mut state = CoordinatorState::new();
+        let t0 = Instant::now();
+        let mut start = bind_input("transcribe", true);
+        start.mode = ShortcutActivation::Toggle;
+        state.on_input(start, t0);
+        let mut combo = bind_input(POST_PROCESS_BINDING, true);
+        combo.mode = ShortcutActivation::Toggle;
+        state.on_input(combo, t0 + ms(100));
+        assert!(!state.upgraded);
     }
 
     fn ms(n: u64) -> Duration {
