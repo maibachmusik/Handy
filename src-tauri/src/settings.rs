@@ -177,11 +177,11 @@ pub enum ShortcutActivation {
     /// Press to start, press again to stop.
     Toggle,
     /// Hold to record, release to stop.
+    #[default]
     PushToTalk,
     /// Hold to record and release to stop, or tap to keep recording until the
     /// next press. Which one it was is decided by how long the key was held
     /// (`hold_threshold_ms`).
-    #[default]
     HoldOrToggle,
 }
 
@@ -240,10 +240,8 @@ pub enum KeyboardImplementation {
 
 impl Default for KeyboardImplementation {
     fn default() -> Self {
-        #[cfg(target_os = "linux")]
-        return KeyboardImplementation::Tauri;
-        #[cfg(not(target_os = "linux"))]
-        return KeyboardImplementation::HandyKeys;
+        // Maibach fork: handy_keys everywhere (needed for side-specific modifiers).
+        KeyboardImplementation::HandyKeys
     }
 }
 
@@ -950,10 +948,9 @@ pub const SETTINGS_STORE_PATH: &str = "settings_store.json";
 pub fn get_default_settings() -> AppSettings {
     #[cfg(target_os = "windows")]
     let default_shortcut = "ctrl+space";
-    #[cfg(target_os = "macos")]
-    let default_shortcut = "option+space";
-    #[cfg(target_os = "linux")]
-    let default_shortcut = "ctrl+alt+space";
+    // Maibach fork: Right Alt/Option ("option_right" parses on every platform in handy-keys).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let default_shortcut = "option_right";
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     let default_shortcut = "alt+space";
 
@@ -970,10 +967,8 @@ pub fn get_default_settings() -> AppSettings {
     );
     #[cfg(target_os = "windows")]
     let default_post_process_shortcut = "ctrl+shift+space";
-    #[cfg(target_os = "macos")]
-    let default_post_process_shortcut = "option+shift+space";
-    #[cfg(target_os = "linux")]
-    let default_post_process_shortcut = "ctrl+alt+shift+space";
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let default_post_process_shortcut = "option_right+control_right";
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     let default_post_process_shortcut = "alt+shift+space";
 
@@ -1462,10 +1457,7 @@ mod tests {
     fn empty_store_parses_with_defaults() {
         let settings: AppSettings = serde_json::from_value(serde_json::json!({}))
             .expect("all AppSettings fields need serde defaults");
-        assert_eq!(
-            settings.shortcut_activation,
-            ShortcutActivation::HoldOrToggle
-        );
+        assert_eq!(settings.shortcut_activation, ShortcutActivation::PushToTalk);
         assert_eq!(settings.hold_threshold_ms, default_hold_threshold_ms());
         assert!(!settings.audio_feedback);
         assert!(settings.filler_word_removal_enabled);
@@ -1658,11 +1650,11 @@ mod tests {
         let defaults = get_default_settings();
         assert_eq!(
             defaults.bindings["transcribe"].current_binding,
-            "ctrl+alt+space"
+            "option_right"
         );
         assert_eq!(
             defaults.bindings["transcribe_with_post_process"].current_binding,
-            "ctrl+alt+shift+space",
+            "option_right+control_right",
         );
     }
 
@@ -1915,15 +1907,12 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_activation_defaults_to_hold_or_toggle_without_legacy_key() {
+    fn shortcut_activation_defaults_to_push_to_talk_without_legacy_key() {
         let mut settings = get_default_settings();
         let raw = serde_json::json!({ "selected_model": "" });
 
         apply_settings_migrations(&mut settings, &raw);
-        assert_eq!(
-            settings.shortcut_activation,
-            ShortcutActivation::HoldOrToggle
-        );
+        assert_eq!(settings.shortcut_activation, ShortcutActivation::PushToTalk);
     }
 
     #[test]
