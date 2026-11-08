@@ -24,6 +24,13 @@ cp "$rel/handy" "$dest/bin/handy"
 cp -a "$appdir/lib/Handy" "$dest/lib/"
 cp -a "$libdir"/*.so* "$dest/lib/"
 
+# libtranscribe's CPU backend calls cblas_* but only links libblas.so.3 (no cblas symbols on Arch's
+# netlib blas), so dictation dies with "undefined symbol: cblas_sgemm". Handy's own launch-at-login
+# rewrites the autostart entry to the bare binary, so an env-var launcher can't carry the fix: make the
+# library load CBLAS itself. Needs patchelf (`pip install --user patchelf`) and Arch's cblas package.
+patchelf=$(command -v patchelf || echo "$HOME/.local/bin/patchelf")
+"$patchelf" --add-needed libcblas.so.3 "$(readlink -f "$dest/lib/libtranscribe.so.0.4")"
+
 launcher=$HOME/.local/bin/handy-maibach
 tmp=$(mktemp "$launcher.XXXXXX")
 cat > "$tmp" <<EOF
@@ -35,6 +42,7 @@ EOF
 chmod +x "$tmp"
 mv "$tmp" "$launcher"
 
-missing=$(LD_LIBRARY_PATH=$dest/lib ldd "$dest/bin/handy" | grep -c "not found" || true)
-echo "installed to $dest (unresolved libraries: $missing); launcher: $launcher"
-echo "autostart: set Exec=$launcher in ~/.config/autostart/Handy.desktop"
+missing=$(ldd "$dest/bin/handy" | grep -c "not found" || true)
+worker=$(LD_BIND_NOW=1 timeout 5 "$dest/bin/handy" --transcribe-worker </dev/null 2>&1 | grep -c "symbol lookup error" || true)
+echo "installed to $dest (unresolved libraries: $missing, worker symbol errors: $worker); launcher: $launcher"
+echo "Handy's launch-at-login points autostart at $dest/bin/handy directly, which works on its own."
