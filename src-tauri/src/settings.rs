@@ -968,7 +968,7 @@ pub fn get_default_settings() -> AppSettings {
     #[cfg(target_os = "windows")]
     let default_post_process_shortcut = "ctrl+shift+space";
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let default_post_process_shortcut = "option_right+control_right";
+    let default_post_process_shortcut = "option_right+command_right";
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     let default_post_process_shortcut = "alt+shift+space";
 
@@ -1654,7 +1654,7 @@ mod tests {
         );
         assert_eq!(
             defaults.bindings["transcribe_with_post_process"].current_binding,
-            "option_right+control_right",
+            "option_right+command_right",
         );
     }
 
